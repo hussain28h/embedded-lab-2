@@ -1,0 +1,192 @@
+#include "mbed.h"
+using namespace std::chrono;
+
+//=====[Inputs]===============================================================
+
+DigitalIn btnEnter(BUTTON1);
+DigitalIn gasSensor(D2);
+DigitalIn tempSensor(D3);
+DigitalIn btnA(D4);
+DigitalIn btnB(D5);
+DigitalIn btnC(D6);
+DigitalIn btnD(D7);
+
+//=====[Outputs & Serial]====================================================
+
+DigitalOut ledAlarm(LED1);
+DigitalOut ledWrongCode(LED3);
+DigitalOut ledSystemLock(LED2);
+UnbufferedSerial serial(USBTX, USBRX, 115200);
+
+//=====[Timers & States]=====================================================
+
+Timer lockTimer;
+int wrongCodeCount = 0;
+bool isLocked = false;
+bool isEmergency = false;
+bool alarmOn = false;
+bool blinkLED2 = false;
+
+bool simGas = false, simTemp = false, simEnter = false;
+bool simA = false, simB = false, simC = false, simD = false;
+
+bool prevAlarm = false, prevWrong = false, prevLock = false;
+
+//=====[Helpers]=============================================================
+
+void log(const char* msg) {
+    serial.write(msg, strlen(msg));
+}
+
+void updateLEDs() {
+    if (ledAlarm != prevAlarm) {
+        log(ledAlarm ? "ALARM ON (LED1)\r\n" : "ALARM OFF (LED1)\r\n");
+        prevAlarm = ledAlarm;
+    }
+    if (ledWrongCode != prevWrong) {
+        log(ledWrongCode ? "WRONG CODE (LED3)\r\n" : "CODE CLEARED (LED3)\r\n");
+        prevWrong = ledWrongCode;
+    }
+    if (ledSystemLock != prevLock) {
+        log(ledSystemLock ? "SYSTEM LOCKED (LED2)\r\n" : "LOCK CLEARED (LED2)\r\n");
+        prevLock = ledSystemLock;
+    }
+}
+
+void startLockout() {
+    isLocked = true;
+    lockTimer.start();
+    ledWrongCode = 0;
+
+    log("System is locked for 60 seconds...\r\n");
+    while (lockTimer.read() < 60) {
+        ledWrongCode = !ledWrongCode;
+        updateLEDs();
+        ThisThread::sleep_for(500ms);
+    }
+
+    lockTimer.stop();
+    lockTimer.reset();
+    wrongCodeCount = 0;
+    isLocked = false;
+    ledWrongCode = 0;
+    log("Lockout ended.\r\n");
+}
+
+void clearAlarm() {
+    alarmOn = false;
+    isEmergency = false;
+    blinkLED2 = false;
+    ledSystemLock = 0;
+    log("Alarm cleared.\r\n");
+}
+
+void handleCommand(char* command) {
+    if (strcmp(command, "trigger gas") == 0) {
+        simGas = true;
+        log("Simulated gas detected.\r\n");
+    } else if (strcmp(command, "trigger temp") == 0) {
+        simTemp = true;
+        log("Simulated temp detected.\r\n");
+    } else if (strcmp(command, "clear") == 0) {
+        simGas = simTemp = false;
+        log("Simulated sensors reset.\r\n");
+    } else if (strncmp(command, "enter code ", 11) == 0) {
+        simA = simB = simC = simD = false;
+        for (int i = 11; command[i]; ++i) {
+            if (command[i] == 'a') simA = true;
+            else if (command[i] == 'b') simB = true;
+            else if (command[i] == 'c') simC = true;
+            else if (command[i] == 'd') simD = true;
+        }
+        simEnter = true;
+        log("Code entered via serial.\r\n");
+    } else if (strcmp(command, "wrong") == 0) {
+        simEnter = true;
+        simA = simB = simC = simD = false;
+        log("Wrong code via serial.\r\n");
+    } else {
+        log("Invalid command.\r\n");
+    }
+}
+
+//=====[Main Loop]===========================================================
+
+int main() {
+    gasSensor.mode(PullDown);
+    tempSensor.mode(PullDown);
+    btnA.mode(PullDown);
+    btnB.mode(PullDown);
+    btnC.mode(PullDown);
+    btnD.mode(PullDown);
+
+    ledAlarm = ledWrongCode = ledSystemLock = 0;
+    log("System ready. Commands: trigger gas/temp, clear, enter code ab, wrong\r\n");
+
+    char buffer[32];
+    int bufferIndex = 0;
+
+    while (true) {
+        if (serial.readable()) {
+            char ch;
+            serial.read(&ch, 1);
+            if (ch == '\r' || ch == '\n') {
+                buffer[bufferIndex] = '\0';
+                handleCommand(buffer);
+                bufferIndex = 0;
+            } else if (bufferIndex < sizeof(buffer) - 1) {
+                buffer[bufferIndex++] = ch;
+            }
+        }
+
+        if (isLocked) {
+            startLockout();
+            continue;
+        }
+
+        bool gas = gasSensor.read() || simGas;
+        bool temp = tempSensor.read() || simTemp;
+        bool enter = btnEnter.read() || simEnter;
+
+        bool a = btnA.read() || simA;
+        bool b = btnB.read() || simB;
+        bool c = btnC.read() || simC;
+        bool d = btnD.read() || simD;
+
+        if (gas || temp) {
+            if (!alarmOn) log("Alarm triggered.\r\n");
+            alarmOn = true;
+        }
+
+        if (gas && temp) {
+            if (!isEmergency) log("Emergency mode active.\r\n");
+            isEmergency = true;
+            blinkLED2 = true;
+        }
+
+        if (blinkLED2) {
+            ledSystemLock = !ledSystemLock;
+            updateLEDs();
+            ThisThread::sleep_for(250ms);
+        }
+
+        ledAlarm = alarmOn;
+        updateLEDs();
+
+        if (enter && !isLocked) {
+            simEnter = false;
+
+            if (a && b && !c && !d) {
+                clearAlarm();
+            } else {
+                ledWrongCode = 1;
+                wrongCodeCount++;
+                log("Wrong code attempt.\r\n");
+
+                if (wrongCodeCount >= 5) {
+                    startLockout();
+                }
+            }
+        }
+    }
+}
